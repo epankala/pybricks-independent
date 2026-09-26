@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pybricks-independent"
+dynamic = ["version"]
+description = "Compile, upload and debug standalone Pybricks hub programs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pybricksdev>=2.3,<3", "bleak>=3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+pybricks-independent = "pybricks_independent.cli:main"
+
+[tool.hatch.version]
+path = "src/pybricks_independent/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# MicroPython programs for the hub.
+"hub/*" = ["I", "UP"]
