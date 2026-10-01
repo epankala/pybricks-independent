@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from bleak.exc import BleakGATTProtocolError, BleakGATTProtocolErrorCode
-from pybricksdev.ble.pybricks import CommandError, StatusFlag
+from pybricksdev.ble.pybricks import Command, CommandError, StatusFlag
 from pybricksdev.connections import ConnectionState
 from reactivex.subject import BehaviorSubject
 
@@ -30,6 +30,9 @@ class FakeHub:
         self.connection_state_observable = BehaviorSubject(ConnectionState.DISCONNECTED)
         self.failures = {k: list(v) for k, v in (failures or {}).items()}
         self.calls = []
+
+    async def write_gatt_char(self, uuid, data, response):
+        self.calls.append("write")
 
     async def _call(self, name, *args):
         self.calls.append(name)
@@ -162,3 +165,60 @@ def test_compile_writes_mpy(tmp_path):
     args = cli.parse_args(["compile", str(WORKER), "-o", str(out)])
     assert asyncio.run(cli.cmd_compile(args)) == 0
     assert list(program.image_modules(out.read_bytes())) == ["__main__"]
+
+
+class StallingHub(FakeHub):
+    """Uploads like pybricksdev (15-byte chunks via write_gatt_char); stalls on chunk ``stall_at``."""
+
+    def __init__(self, stall_at=None):
+        super().__init__()
+        self.stall_at = stall_at
+        self.chunks = 0
+
+    async def write_gatt_char(self, uuid, data, response):
+        if data[0] == Command.COMMAND_WRITE_USER_RAM:
+            if self.chunks == self.stall_at:
+                await asyncio.sleep(3600)  # write never confirmed
+            self.chunks += 1
+
+    async def download(self, path):
+        self.calls.append("download")
+        for _ in range(200):
+            await self.write_gatt_char("uuid", bytes([Command.COMMAND_WRITE_USER_RAM]) + bytes(4) + b"x" * 15, True)
+
+
+def test_stalled_upload_is_detected_quickly_and_retried(monkeypatch, caplog):
+    monkeypatch.setattr(cli, "WRITE_STALL_TIMEOUT", 0.05)
+    first, second = StallingHub(stall_at=160), StallingHub()
+    assert run_command(monkeypatch, ["download", str(WORKER)], [first, second]) == 0
+    assert first.calls == ["connect", "download", "disconnect"]
+    assert second.chunks == 200
+    stalled = [m for m in caplog.messages if "stalled" in m]
+    assert len(stalled) == 1 and "after 2400 program bytes" in stalled[0]
+
+
+def test_stall_guard_is_removed_after_prepare(monkeypatch):
+    hub = StallingHub()
+    run_command(monkeypatch, ["download", str(WORKER)], [hub])
+    assert "write_gatt_char" not in vars(hub)
+
+
+def test_stall_guard_also_covers_other_hub_writes(monkeypatch):
+    monkeypatch.setattr(cli, "WRITE_STALL_TIMEOUT", 0.05)
+
+    class StuckStopHub(FakeHub):
+        async def stop_user_program(self):
+            self.calls.append("stop")
+            await self.write_gatt_char("uuid", bytes([Command.STOP_USER_PROGRAM]), True)
+
+        async def write_gatt_char(self, uuid, data, response):
+            await asyncio.sleep(3600)
+
+    with pytest.raises(cli.WriteStalled):
+        run_command(monkeypatch, ["stop", "--attempts", "1"], [StuckStopHub()])
+
+
+def test_settle_and_attempt_defaults():
+    args = cli.parse_args(["download", str(WORKER)])
+    assert (args.settle, args.attempts) == (0.0, 5)
+    assert cli.parse_args(["run", "--settle", "2.5", str(WORKER)]).settle == 2.5

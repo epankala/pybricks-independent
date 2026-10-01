@@ -8,13 +8,14 @@ import argparse
 import asyncio
 import logging
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 from bleak.exc import BleakError, BleakGATTProtocolError
 from pybricksdev.ble import find_device
-from pybricksdev.ble.pybricks import CommandError, StatusFlag
+from pybricksdev.ble.pybricks import Command, CommandError, StatusFlag
 from pybricksdev.connections import ConnectionState
 from pybricksdev.connections.pybricks import HubDisconnectError, PybricksHubBLE
 
@@ -28,10 +29,49 @@ STOP_PROGRAM_RETRIES = 3
 STOP_PROGRAM_SETTLE = 0.5
 # Failures worth a fresh attempt; typically a flaky BLE link during upload.
 RETRY_ERRORS = (BleakError, HubDisconnectError, TimeoutError, asyncio.TimeoutError)
+# A hub write normally completes in well under 0.1 s. When one stalls, BlueZ only gives up
+# after ~30 s and queues everything behind it, so fail fast and reconnect instead.
+WRITE_STALL_TIMEOUT = 3.0
+USER_RAM_HEADER = 5  # command byte + 32-bit offset in front of each program chunk
 
 
 class HubNotFound(Exception):
     pass
+
+
+class WriteStalled(TimeoutError):
+    pass
+
+
+@contextmanager
+def stall_guard(hub: PybricksHubBLE) -> Iterator[None]:
+    """Give every BLE write to the hub a deadline while preparing it (uploads, program start/stop).
+
+    pybricksdev sends each program chunk through ``hub.write_gatt_char``, so wrapping it covers
+    its whole upload without reimplementing it.
+    """
+    loop = asyncio.get_running_loop()
+    connected_at = loop.time()
+    write = hub.write_gatt_char
+    uploaded = 0
+
+    async def guarded_write(uuid, data, response):
+        nonlocal uploaded
+        try:
+            await asyncio.wait_for(write(uuid, data, response), WRITE_STALL_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise WriteStalled(
+                f"Bluetooth write stalled for {WRITE_STALL_TIMEOUT:g} s after {uploaded} program bytes, "
+                f"{loop.time() - connected_at:.1f} s after connecting"
+            ) from None
+        if data and data[0] == Command.COMMAND_WRITE_USER_RAM:
+            uploaded += len(data) - USER_RAM_HEADER
+
+    hub.write_gatt_char = guarded_write
+    try:
+        yield
+    finally:
+        del hub.write_gatt_char  # back to the class method
 
 
 def error_text(e: BaseException) -> str:
@@ -79,7 +119,11 @@ async def connect(args: argparse.Namespace, prepare: Callable[[PybricksHubBLE], 
         try:
             await hub.connect()
             logger.info("connected to %s, Pybricks firmware %s", device.name, hub.fw_version)
-            await prepare(hub)
+            with stall_guard(hub):
+                if args.settle:
+                    # Lets the BLE link finish renegotiating its parameters before the busy upload.
+                    await asyncio.sleep(args.settle)
+                await prepare(hub)
             return hub
         except RETRY_ERRORS as e:
             await disconnect_quietly(hub)
@@ -196,7 +240,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     hub_options.add_argument(
         "--scan-timeout", type=float, default=10.0, help="scan timeout in s (default: %(default)s)"
     )
-    hub_options.add_argument("--attempts", type=int, default=3, help="connect/upload attempts (default: %(default)s)")
+    hub_options.add_argument("--attempts", type=int, default=5, help="connect/upload attempts (default: %(default)s)")
+    hub_options.add_argument(
+        "--settle",
+        type=float,
+        default=0.0,
+        help="wait this long after connecting before uploading (default: %(default)s)",
+    )
 
     commands = parser.add_subparsers(dest="command", required=True)
     for name, (_, help_text) in COMMANDS.items():

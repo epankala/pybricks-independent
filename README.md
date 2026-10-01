@@ -26,8 +26,15 @@ name, `ARGS="..."` passes tool options (`--attempts`, `--scan-timeout`, `-v`). W
 Pybricks keeps the uploaded program on the hub, also across power-offs, so after
 `make download` the hub works without the PC: press its button to start the program.
 
-Uploads are retried (`--attempts`, default 3) since BLE links occasionally drop mid-upload,
-and a program already running on the hub is stopped first.
+Uploads are retried (`--attempts`, default 5) since BLE links occasionally drop mid-upload,
+and a program already running on the hub is stopped first. A Bluetooth write that gets no
+answer within 3 s counts as a stalled link: the tool logs how far the upload got and how
+long after connecting (e.g. `stalled ... after 2400 program bytes, 2.7 s after connecting`),
+then reconnects and starts over, instead of waiting ~30 s for BlueZ to give up.
+
+If uploads keep stalling at a similar time after connecting, try `ARGS="--settle 3"`: it
+waits after connecting so the link can finish renegotiating its parameters before the
+upload starts.
 
 ## Sample program: remote-controlled tank drive
 
