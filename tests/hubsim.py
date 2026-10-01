@@ -16,10 +16,13 @@ class Sim:
     buttons pressed (names like "LEFT_PLUS"), or ``None`` for "remote disconnected".
     ``remote_failures``: number of Remote() searches that time out before one succeeds.
     ``volts``: battery voltage in mV, or a list of ``(t_ms, mV)`` steps.
+    ``ports``: letter -> device kind ("motor", "dcmotor", "light" or None), or a list of
+    ``(t_ms, kind)`` steps for plugging/unplugging; A and B default to "motor".
     """
 
-    def __init__(self, buttons=(), remote_failures=0, volts=7600, max_speed=1000):
+    def __init__(self, buttons=(), remote_failures=0, volts=7600, max_speed=1000, ports=None):
         self.clock = 0
+        self.ports = {"A": "motor", "B": "motor", **(ports or {})}
         self.buttons = sorted(buttons, key=lambda b: b[0])
         self.remote_failures = remote_failures
         self.volts = volts
@@ -34,6 +37,12 @@ class Sim:
         self.clock += ms
         if self.clock > self.until:
             raise StopSim
+
+    def device_at(self, port):
+        spec = self.ports.get(port)
+        if not isinstance(spec, list):
+            return spec
+        return [kind for t, kind in spec if t <= self.clock][-1]
 
     def pressed_now(self):
         current = set()
@@ -75,7 +84,7 @@ class Sim:
         Direction = Enum(["CLOCKWISE", "COUNTERCLOCKWISE"])
         Port = Enum("A B C D".split())
 
-        class Light:
+        class StatusLight:
             def __init__(self, owner):
                 self.owner = owner
 
@@ -96,24 +105,71 @@ class Sim:
 
         class TechnicHub:
             def __init__(self):
-                self.light = Light("hub")
+                self.light = StatusLight("hub")
                 self.battery = Battery()
 
         class Control:
             def limits(self):
                 return (sim.max_speed, 2000, 100)
 
-        class Motor:
-            def __init__(self, port, positive_direction=Direction.CLOCKWISE):
+        class PortDevice:
+            kinds = ()
+
+            def __init__(self, port):
                 self.port = port
+                self.kind = sim.device_at(port)
+                if self.kind not in self.kinds:
+                    raise OSError(19, f"no {type(self).__name__} on port {port}")
+
+            def plugged(self):
+                if sim.device_at(self.port) != self.kind:
+                    raise OSError(19, "device unplugged")
+
+        class PUPDevice(PortDevice):
+            kinds = ("motor", "dcmotor", "light")
+            IDS = {"motor": 48, "dcmotor": 2, "light": 8}
+
+            def info(self):
+                return {"id": self.IDS[self.kind]}
+
+        class Motor(PortDevice):
+            kinds = ("motor",)
+
+            def __init__(self, port, positive_direction=Direction.CLOCKWISE):
+                super().__init__(port)
                 self.control = Control()
                 sim.log("motor init", port, positive_direction)
 
             def run(self, speed):
+                self.plugged()
                 sim.log("run", self.port, speed)
 
             def stop(self):
+                self.plugged()
                 sim.log("stop", self.port)
+
+        class DCMotor(PortDevice):
+            kinds = ("dcmotor", "motor")
+
+            def dc(self, duty):
+                self.plugged()
+                sim.log("dc", self.port, duty)
+
+            def stop(self):
+                self.plugged()
+                sim.log("stop", self.port)
+
+        class Light(PortDevice):
+            # Assumed as permissive as a DC output: it would also power a DC motor.
+            kinds = ("light", "dcmotor")
+
+            def on(self, brightness=100):
+                self.plugged()
+                sim.log("port light", self.port, "on", brightness)
+
+            def off(self):
+                self.plugged()
+                sim.log("port light", self.port, "off")
 
         class Buttons:
             def pressed(self):
@@ -133,7 +189,7 @@ class Sim:
                     raise OSError(110, "timed out")
                 sim.log("remote connected")
                 self.buttons = Buttons()
-                self.light = Light("remote")
+                self.light = StatusLight("remote")
 
         class StopWatch:
             def __init__(self):
@@ -148,15 +204,25 @@ class Sim:
         return {
             "pybricks": types.ModuleType("pybricks"),
             "pybricks.hubs": _module("pybricks.hubs", TechnicHub=TechnicHub),
+            "pybricks.iodevices": _module("pybricks.iodevices", PUPDevice=PUPDevice),
             "pybricks.parameters": _module(
                 "pybricks.parameters", Button=Button, Color=Color, Direction=Direction, Port=Port
             ),
-            "pybricks.pupdevices": _module("pybricks.pupdevices", Motor=Motor, Remote=Remote),
+            "pybricks.pupdevices": _module(
+                "pybricks.pupdevices", DCMotor=DCMotor, Light=Light, Motor=Motor, Remote=Remote
+            ),
             "pybricks.tools": _module("pybricks.tools", StopWatch=StopWatch, wait=sim.advance),
         }
 
 
-MODULES = ("pybricks", "pybricks.hubs", "pybricks.parameters", "pybricks.pupdevices", "pybricks.tools")
+MODULES = (
+    "pybricks",
+    "pybricks.hubs",
+    "pybricks.iodevices",
+    "pybricks.parameters",
+    "pybricks.pupdevices",
+    "pybricks.tools",
+)
 
 
 def _module(name, **attrs):

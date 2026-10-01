@@ -37,6 +37,7 @@ No pairing needed: switch on the remote and the hub connects to the first one it
 |--------------------|------------------------------------------|
 | Left + / −         | Motor A forward / backward (while held)  |
 | Right + / −        | Motor B forward / backward (while held)  |
+| Red right / left   | Motor C forward / backward (if attached) |
 | Green center       | Next speed gear: 30 % / 60 % / 100 %     |
 
 The motors use closed-loop speed control (`Motor.run`), so speed holds under load and at
@@ -51,6 +52,22 @@ tracks forward. The remote light shows the gear (green / yellow / red).
 
 If the remote switches off or goes out of range, the motors stop and the hub searches
 for it again.
+
+### Optional devices on ports C and D
+
+Ports C and D are checked whenever the remote (re)connects, so devices can be added
+between sessions:
+
+- **Port C motor**: driven by the red buttons at the current gear. An encoder motor uses
+  closed-loop speed (`Motor.run`); a plain motor such as a train motor uses power
+  (`DCMotor.dc`, 30 / 60 / 100 %).
+- **Port D light**: switches on as soon as any motor (A, B or C) runs and stays on until
+  no motor has run for a minute (`LIGHT_IDLE_MS`). It is only used if the device reports
+  itself as a light (type id 8), so a motor plugged into D is never powered as a light.
+  While the hub searches for a lost remote, the idle minute is checked between search
+  attempts, so the light may go off up to 10 s late.
+
+Unplugging C or D while driving just stops using it; the remote stays connected.
 
 ## Debug mode
 
